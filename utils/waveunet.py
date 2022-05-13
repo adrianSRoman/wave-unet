@@ -252,7 +252,7 @@ class Waveunet(nn.Module):
 
     def forward(self, x, inst=None):
         curr_input_size = x.shape[-1]
-#         print(f'current input size : {curr_input_size}; self input size : {self.input_size}')
+        #print(f'current input size : {curr_input_size}; self input size : {self.input_size}')
         assert(curr_input_size == self.input_size)
 
         # User promises to feed the proper input himself, to get the pre-calculated (NOT the originally desired) output size

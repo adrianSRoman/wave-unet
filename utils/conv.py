@@ -12,7 +12,8 @@ class ConvLayer(nn.Module):
 
         # How many channels should be normalised as one group if GroupNorm is activated
         # WARNING: Number of channels has to be divisible by this number!
-        NORM_CHANNELS = 8
+        # NORM_CHANNELS = 8
+        NORM_CHANNELS = 2 # [asroman] comment to suppoty only 2 ch features
 
         if self.transpose:
             self.filter = nn.ConvTranspose1d(n_inputs, n_outputs, self.kernel_size, stride, padding=kernel_size-1)

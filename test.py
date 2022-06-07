@@ -8,6 +8,10 @@ import data.utils
 import utils.model_helper as model_utils
 import utils
 
+# Added to test SDR analysis
+import h5py
+import librosa
+
 def compute_model_output(model, inputs):
     '''
     Computes outputs of model with given inputs. Does NOT allow propagating gradients! See compute_loss for training.
@@ -32,48 +36,36 @@ def predict(audio, model):
     else:
         return_mode = "numpy"
 
+    output = None
     expected_outputs = audio.shape[1]
-
     # Pad input if it is not divisible in length by the frame shift number
     output_shift = model.shapes["output_frames"]
     pad_back = audio.shape[1] % output_shift
     pad_back = 0 if pad_back == 0 else output_shift - pad_back
     if pad_back > 0:
         audio = np.pad(audio, [(0,0), (0, pad_back)], mode="constant", constant_values=0.0)
-
     target_outputs = audio.shape[1]
     outputs = np.zeros(audio.shape, np.float32)
 
     # Pad mixture across time at beginning and end so that neural network can make prediction at the beginning and end of signal
     pad_front_context = model.shapes["output_start_frame"]
     pad_back_context = model.shapes["input_frames"] - model.shapes["output_end_frame"]
-    audio = np.pad(audio, [(0,0), (pad_front_context, pad_back_context)], mode="constant", constant_values=0.0)
 
-    # Iterate over mixture magnitudes, fetch network prediction
-    with torch.no_grad():
-        for target_start_pos in range(0, target_outputs, model.shapes["output_frames"]):
-            # Prepare mixture excerpt by selecting time interval
-            curr_input = audio[:, target_start_pos:target_start_pos + model.shapes["input_frames"]] # Since audio was front-padded input of [targetpos:targetpos+inputframes] actually predicts [targetpos:targetpos+outputframes] target range
-
-            # Convert to Pytorch tensor for model prediction
-            curr_input = torch.from_numpy(curr_input).unsqueeze(0)
-
-            # Predict
-            # for key, curr_targets in compute_model_output(model, curr_input).items():
-            #     outputs[key][:,target_start_pos:target_start_pos+model.shapes["output_frames"]] = curr_targets.squeeze(0).cpu().numpy()
-            curr_targets = compute_model_output(model, curr_input)
-            x = curr_targets.squeeze(0).cpu().numpy()
-
-            outputs[:,target_start_pos:target_start_pos+model.shapes["output_frames"]] = curr_targets.squeeze(0).cpu().numpy()
-
-    # Crop to expected length (since we padded to handle the frame shift)
-    outputs = outputs[:,:expected_outputs]
-
-    if return_mode == "pytorch":
-        outputs = torch.from_numpy(outputs)
-        if is_cuda:
-            outputs = outputs.cuda()
-    return outputs
+    framed_audio_a = librosa.util.frame(audio, model.shapes["output_frames"], model.shapes["output_frames"], axis=1)#53929, 53929, axis=1)
+    framed_audio_a = np.transpose(framed_audio_a, (1, 0, 2))
+    
+    for frame_a in framed_audio_a:
+        frame_a = np.pad(frame_a, [(0,0), (pad_front_context, pad_back_context)], mode="constant", constant_values=0.0)
+        frame_a = frame_a[np.newaxis, :]
+        frame_a = frame_a / (np.max(np.abs(frame_a)) + 1e-5)
+        outputs = model(torch.FloatTensor(frame_a))
+        x = outputs.detach().cpu().numpy()
+        x = np.squeeze(x)
+        if output is None:
+            output = x
+        else:
+            output = np.append(output, x, axis=1)
+    return output #, total_SDR / len_SDR
 
 def predict_song(args, audio_path, model):
     '''
@@ -87,44 +79,78 @@ def predict_song(args, audio_path, model):
     model.eval()
 
     # Load mixture in original sampling rate
-    mix_audio, mix_sr = data.utils.load(audio_path, sr=48000, mono=False)
+    if audio_path.endswith('.wav'):
+        mix_audio,_ = data.utils.load(audio_path, sr=args.sr, mono=False)
+    elif audio_path.endswith('.hdf'):
+        hdf_data = h5py.File(audio_path, "r")
+        mix_audio = hdf_data["Park-04-Raw"]['A']
+    else:
+        print("Error: file needs to be .wav or .hdf format")
+
     mix_channels = mix_audio.shape[0]
     mix_len = mix_audio.shape[1]
     # Adapt mixture channels to required input channels
     assert(mix_channels == args.num_in_chan)
-
-    # resample to model sampling rate
-    mix_audio = data.utils.resample(mix_audio, mix_sr, args.sr)
+    mix_len = mix_audio.shape[1]
     sources = predict(mix_audio, model)
-
-    # # Resample back to mixture sampling rate in case we had model on different sampling rate
-    # sources = {key : data.utils.resample(sources[key], args.sr, mix_sr) for key in sources.keys()}
-
-    # # In case we had to pad the mixture at the end, or we have a few samples too many due to inconsistent down- and upsamṕling, remove those samples from source prediction now
-    # for key in sources.keys():
-    print("sources shape", sources.shape)
-    print("mix_len", mix_len)
-    diff = sources.shape[1] - mix_len
-    if diff > 0:
-        print("WARNING: Cropping " + str(diff) + " samples")
-        sources = sources[:, :-diff]
-    elif diff < 0:
-        print("WARNING: Padding output by " + str(diff) + " samples")
-        sources = np.pad(sources, ((0,0), (0, -diff)), "constant")
-
-    # # Adapt channels
-    # if mix_channels > args.channels:
-    #     assert(args.channels == 1)
-    #     # Duplicate mono predictions
-    #     sources[key] = np.tile(sources[key], [mix_channels, 1])
-    # elif mix_channels < args.channels:
-    #     assert(mix_channels == 1)
-    #     # Reduce model output to mono
-    #     sources[key] = np.mean(sources[key], axis=0, keepdims=True)
-
-    #     sources[key] = np.asfortranarray(sources[key]) # So librosa does not complain if we want to save it
-
+    if args.target is not None: # Under development
+        target = h5py.File(args.target, "r") #"/scratch/binaural_data/train30sec.hdf"
+        target_scene = target["Park-04-Raw"]['B']
+        total_err, min_error, max_error, mean_abs, min_abs, max_abs = get_performance(target_scene, sources, model)
+        print(f'scene:{args.target}, SDR:{total_err}, min_SDR:{min_error}, max_SDR:{max_error}, mean_abs:{mean_abs}, min_abs:{min_abs}, max_abs:{max_abs}')
     return sources
+
+
+def get_performance(target_scene, pred_scene, model):
+    # TODO: under development
+    # - Match frames with pred vs. target
+    # print("target_scene", target_scene.shape)
+    # print("pred_scene", pred_scene.shape)
+    total_SDR, min_SDR, max_SDR = None, None, None
+    total_abs, min_abs, max_abs = None, None, None
+    len_SDR = 0
+    pred_framed = librosa.util.frame(pred_scene, model.shapes["output_frames"], model.shapes["output_frames"], axis=1)
+    pred_framed = np.transpose(pred_framed, (1, 0, 2))
+    # print("framed_audio", pred_framed.shape)
+
+    # output_shift = model.shapes["output_frames"]
+    # pad_back = target_scene.shape[1] % output_shift
+    # pad_back = 0 if pad_back == 0 else output_shift - pad_back
+    # if pad_back > 0:
+    #     target_scene = np.pad(target_scene, [(0,0), (0, pad_back)], mode="constant", constant_values=0.0)
+    pad_front_context = model.shapes["output_start_frame"]
+    pad_back_context = model.shapes["input_frames"] - model.shapes["output_end_frame"]
+    target_scene = np.pad(target_scene, [(0,0), (pad_front_context, pad_back_context)], mode="constant", constant_values=0.0)
+    target_framed = librosa.util.frame(target_scene, model.shapes["output_frames"], model.shapes["output_frames"], axis=1)
+    print("model.shapes[output_frames]", model.shapes["output_frames"])
+    target_framed = np.transpose(target_framed, (1, 0, 2))
+    print("framed_audio", target_framed.shape)
+    
+    for pred_frame, target_frame in zip(pred_framed, target_framed):
+        # print("pred_frame shape", pred_frame.shape)
+        target_frame = np.transpose(target_frame[np.newaxis, :, :], (0, 2, 1))
+        pred_frame = np.transpose(pred_frame[np.newaxis, :, :], (0, 2, 1))
+        SDR, ISR, SIR, SAR, _ = museval.metrics.bss_eval(target_frame, pred_frame)
+        abs_diff_ch1 = np.mean(np.abs(target_frame[:,:,0] - pred_frame[:,:,0]), axis=1)[0]
+        abs_diff_ch2 = np.mean(np.abs(target_frame[:,:,1] - pred_frame[:,:,1]), axis=1)[0]
+
+        if min_SDR is None or max_SDR is None or total_SDR is None:
+            min_SDR, max_SDR, total_SDR = SDR, SDR, SDR
+        else:
+            min_SDR = SDR if SDR < min_SDR else min_SDR
+            max_SDR = SDR if SDR > max_SDR else max_SDR
+            total_SDR = total_SDR + SDR
+        if min_abs is None:
+            min_abs = [abs_diff_ch1, abs_diff_ch2]
+            max_abs = [abs_diff_ch1, abs_diff_ch2]
+            total_abs = [abs_diff_ch1, abs_diff_ch2]
+        else:
+            min_abs = [abs_diff_ch1, abs_diff_ch2] if abs_diff_ch1 < min_abs[0] or abs_diff_ch2 < min_abs[1] else min_abs
+            max_abs = [abs_diff_ch1, abs_diff_ch2] if abs_diff_ch1 > max_abs[0] or abs_diff_ch2 > max_abs[1] else max_abs
+            total_abs = list( np.array(total_abs) + np.array([abs_diff_ch1, abs_diff_ch2]))
+        len_SDR += 1
+
+    return total_SDR / len_SDR, min_SDR, max_SDR, list(np.array(total_abs) / len_SDR), min_abs, max_abs
 
 def evaluate(args, dataset, model, instruments):
     '''
